@@ -1,0 +1,15 @@
+{
+  "name": "signin-all",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Trae + WorkBuddy + Qoder 每日签到（Docker/Node 版）",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {}
+}

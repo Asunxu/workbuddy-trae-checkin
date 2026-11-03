@@ -1,0 +1,8 @@
+# 本地运行数据与密钥，绝不入库
+.env
+data/
+node_modules/
+
+# 系统与编辑器
+Thumbs.db
+.DS_Store

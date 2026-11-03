@@ -1,0 +1,12 @@
+services:
+  signin-all:
+    build: .
+    image: signin-all:latest
+    container_name: signin-all
+    restart: unless-stopped
+    ports:
+      - "3009:3009"          # 宿主机和容器都固定用 3009
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data     # 账号令牌（加密后）存在这里，升级/重建容器不丢
