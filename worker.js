@@ -3467,6 +3467,20 @@ function tally(d) {
   return { ok, skip, bad, total: rs.length };
 }
 
+/** 按平台把余额/累计信息拼成括号尾巴（接口没给的字段就不显示） */
+function balanceTag(key, r) {
+  const parts = [];
+  if (key === 'trae' && typeof r.credits === 'number') {
+    parts.push('余额 ' + (Math.round(r.credits * 100) / 100));
+  }
+  if (key === 'wb') {
+    if (r.streak != null) parts.push('连签 ' + r.streak + ' 天');
+    if (typeof r.total === 'number') parts.push('累计 ' + r.total);
+  }
+  if (key === 'qoder' && r.lastCredit != null) parts.push('本次 +' + r.lastCredit);
+  return parts.length ? '（' + parts.join('，') + '）' : '';
+}
+
 function formatReport(result) {
   const lines = [];
   const at = String(result.at || '').replace(' +08:00', '');
@@ -3496,9 +3510,9 @@ function formatReport(result) {
     const suffix = extra.length > 1 || t.skip || t.bad ? ' · ' + extra.join(' · ') : '';
     lines.push(`${name}  ${mark} ${done}/${t.total}${suffix}`);
     for (const r of (d.results || []).slice(0, 6)) {
-      if (r.state === 'checked' && r.msg) lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60));
+      if (r.state === 'checked' && r.msg) lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60) + balanceTag(key, r));
       else if (r.state !== 'checked' && r.state !== 'skipped' && r.msg) {
-        lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60));
+        lines.push('   · ' + r.label + ' ' + String(r.msg).slice(0, 60) + balanceTag(key, r));
       }
     }
     if ((d.results || []).length > 6) lines.push('   · …还有 ' + (d.results.length - 6) + ' 个');
@@ -4771,9 +4785,9 @@ export default {
         }
         const demo = {
           at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
-          trae: { results: [{ label: '示例账号', state: 'checked', msg: '+50 积分' }] },
-          wb: { results: [{ label: '示例主号', state: 'skipped', msg: '今日已完成' }] },
-          qoder: { results: [{ label: '示例号', state: 'checked', msg: '领取成功 +100 credits' }] },
+          trae: { results: [{ label: '示例账号', state: 'checked', msg: '签到成功', credits: 687.64 }] },
+          wb: { results: [{ label: '示例主号', state: 'checked', msg: '+100 积分', streak: 7, total: 700 }] },
+          qoder: { results: [{ label: '示例号', state: 'checked', msg: '领取成功', lastCredit: 100 }] },
         };
         const r = await notifyRun(env, demo);
         return json({ ...r, channels: Object.keys(ch) });
