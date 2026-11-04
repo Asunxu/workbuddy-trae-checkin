@@ -297,6 +297,10 @@ server.listen(PORT, () => {
   log(`数据目录：${DATA_DIR}`);
   log(`定时任务（北京时间）：${schedules.join(' ; ')}`);
   if (!env.CRON_SECRET) log('提示：未单独配置 CRON_SECRET，/cron 将回落使用 ADMIN_TOKEN');
+
+  // 真正启动定时调度器（漏掉这行会导致定时任务永不触发）
+  startScheduler();
+  log('定时调度器已启动，每 20 秒检查一次是否命中时间表');
 });
 
 /* 优雅退出：把 KV 落一次盘 */
