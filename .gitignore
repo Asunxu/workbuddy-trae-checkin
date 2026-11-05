@@ -6,3 +6,7 @@ node_modules/
 # 系统与编辑器
 Thumbs.db
 .DS_Store
+
+# 本地辅助脚本（含服务器凭据，勿提交）
+ssh_run.py
+server.server.mjs
