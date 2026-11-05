@@ -263,7 +263,17 @@ async function runCronOnce(trigger) {
   const started = Date.now();
   log(`定时签到开始（${trigger}）`);
   try {
-    await worker.scheduled({}, env, sink);
+    // 必须走 /cron 端点（runAll：签到 + 通知）。
+    // 之前直接调 worker.scheduled 只做签到，notifyRun 永远不会执行，
+    // 导致定时签到成功但 QQ/Telegram 不推送。
+    const secret = env.CRON_SECRET || env.ADMIN_TOKEN;
+    const req = new Request(`http://127.0.0.1:${PORT}/cron`, {
+      method: 'GET',
+      headers: { 'X-Cron-Secret': secret },
+    });
+    const resp = await worker.fetch(req, env, sink);
+    const body = await resp.json().catch(() => null);
+    log('签到结果：', JSON.stringify(body));
   } catch (e) {
     log('定时任务异常：', e.message || e);
   }
