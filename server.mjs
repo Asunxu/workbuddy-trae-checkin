@@ -15,7 +15,8 @@
  *   ADMIN_TOKEN      必填  控制台登录密码
  *   CRON_SECRET      可选  /cron 独立口令，缺省回落到 ADMIN_TOKEN
  *   CRON_SCHEDULES   可选  cron 表达式（北京时间），多条用 ; 分隔
- *                          缺省 "10 8 * * *;20 10 * * *"（08:10 + Qoder 补签 10:20）
+ *                          只是「出厂默认」：控制台顶栏「定时」保存后会覆盖它（存 KV）
+ *                          缺省 "10 8 * * *;20 10 * * *"（08:10 + 补签 10:20）
  *   PORT             可选  监听端口，缺省 3009
  *   DATA_DIR         可选  数据目录，缺省 ./data（Docker 里是 /app/data）
  *
@@ -100,6 +101,7 @@ const env = {
   MASTER_KEY: process.env.MASTER_KEY || '',
   ADMIN_TOKEN: process.env.ADMIN_TOKEN || '',
   CRON_SECRET: process.env.CRON_SECRET || '',
+  CRON_SCHEDULES: process.env.CRON_SCHEDULES || '',
   TG_BOT_TOKEN: process.env.TG_BOT_TOKEN || '',
   TG_CHAT_ID: process.env.TG_CHAT_ID || '',
   QQ_APP_ID: process.env.QQ_APP_ID || '',
@@ -251,12 +253,55 @@ function cronMatches(expr, d) {
   return domOk && dowOk;
 }
 
-const schedules = String(process.env.CRON_SCHEDULES || '10 8 * * *;20 10 * * *')
-  .split(';')
-  .map((s) => s.trim())
-  .filter(Boolean);
+/* 时间表优先级：控制台保存的 KV 配置 > 环境变量 CRON_SCHEDULES > 内置默认值。
+   每次都现读，控制台改完不用重启容器（本函数每 20 秒被调用一次）。 */
+const CRON_KEY = 'cron:config';
+const DEFAULT_CRON = '10 8 * * *;20 10 * * *';
+
+function normHHMM(v) {
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(String(v ?? '').trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (h > 23 || mi > 59) return null;
+  return String(h).padStart(2, '0') + ':' + String(mi).padStart(2, '0');
+}
+
+const hhmmToCron = (t) => {
+  const [h, mi] = String(t).split(':');
+  return `${Number(mi)} ${Number(h)} * * *`;
+};
+
+/** 从内存里的 KV 同步读控制台存的时间表 */
+function kvTimes() {
+  const e = store[CRON_KEY];
+  if (!e || (e.exp && e.exp <= Date.now())) return null;
+  try {
+    const j = JSON.parse(String(e.v || ''));
+    const ts = (Array.isArray(j?.times) ? j.times : []).map(normHHMM).filter(Boolean);
+    return ts.length ? ts : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 当前生效的 cron 表达式列表 */
+function effectiveSchedules() {
+  const fromKv = kvTimes();
+  if (fromKv) return fromKv.map(hhmmToCron);
+  return String(process.env.CRON_SCHEDULES || DEFAULT_CRON)
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+const scheduleLabel = (expr) => {
+  const f = String(expr).trim().split(/\s+/);
+  return f.length === 5 ? `${String(f[1]).padStart(2, '0')}:${String(f[0]).padStart(2, '0')}` : expr;
+};
 
 let lastFiredMinute = '';
+let lastScheduleSig = '';
 
 async function runCronOnce(trigger) {
   const sink = { promises: [], waitUntil(p) { this.promises.push(p); } };
@@ -284,12 +329,19 @@ async function runCronOnce(trigger) {
 /** 每 20 秒看一眼：当前北京时间的分钟是否命中任一条 cron */
 function startScheduler() {
   setInterval(() => {
+    const list = effectiveSchedules();
+    const sig = list.join(';');
+    if (sig !== lastScheduleSig) {
+      lastScheduleSig = sig;
+      log(`定时任务时间表（北京时间）：${list.map(scheduleLabel).join(' / ')}${kvTimes() ? '（来自控制台）' : ''}`);
+    }
     const bj = new Date(Date.now() + 8 * 3600e3);
     const minuteKey = bj.toISOString().slice(0, 16); // 精确到分钟
     if (minuteKey === lastFiredMinute) return;
-    if (schedules.some((s) => cronMatches(s, bj))) {
+    const hit = list.find((s) => cronMatches(s, bj));
+    if (hit) {
       lastFiredMinute = minuteKey;
-      runCronOnce(schedules.find((s) => cronMatches(s, bj)));
+      runCronOnce(scheduleLabel(hit));
     }
   }, 20000);
 }
@@ -305,7 +357,7 @@ if (!preflight()) {
 server.listen(PORT, () => {
   log(`签到服务已启动：http://0.0.0.0:${PORT}`);
   log(`数据目录：${DATA_DIR}`);
-  log(`定时任务（北京时间）：${schedules.join(' ; ')}`);
+  log(`定时任务（北京时间）：${effectiveSchedules().map(scheduleLabel).join(' / ')}（控制台可改，无需重启）`);
   if (!env.CRON_SECRET) log('提示：未单独配置 CRON_SECRET，/cron 将回落使用 ADMIN_TOKEN');
 
   // 真正启动定时调度器（漏掉这行会导致定时任务永不触发）

@@ -3091,6 +3091,67 @@ function repath(request, path) {
   return new Request(u.toString(), request);
 }
 
+/* ------------------------------------------------------------------ */
+/* 定时任务时间表（控制台可改，存 KV；容器调度器每次触发前读取）             */
+/* ------------------------------------------------------------------ */
+
+const CRON_KEY = 'cron:config';
+const CRON_DEFAULT_TIMES = ['08:10', '10:20'];
+
+/** "8:5" / "08:05" → "08:05"；不合法返回 null */
+function normHHMM(v) {
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(String(v ?? '').trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (h > 23 || mi > 59) return null;
+  return String(h).padStart(2, '0') + ':' + String(mi).padStart(2, '0');
+}
+
+/** HH:MM → 5 字段 cron（分 时 * * *），交给宿主调度器解析；北京时间 */
+function hhmmToCron(t) {
+  const [h, mi] = String(t).split(':');
+  return `${Number(mi)} ${Number(h)} * * *`;
+}
+
+/** KV 里存的时间表；没配过返回 null */
+async function kvCronTimes(env) {
+  try {
+    const raw = await env.KV.get(CRON_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw);
+    const ts = (Array.isArray(j?.times) ? j.times : []).map(normHHMM).filter(Boolean);
+    return ts.length ? ts : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 环境变量 CRON_SCHEDULES 里的 cron 反推成 HH:MM（只认「分 时 每天」这种简单形式） */
+function envCronTimes(env) {
+  return String(env.CRON_SCHEDULES || '')
+    .split(';')
+    .map((s) => s.trim().split(/\s+/))
+    .filter((f) => f.length === 5 && f[2] === '*' && f[3] === '*' && f[4] === '*')
+    .map((f) => normHHMM(f[1] + ':' + f[0]))
+    .filter(Boolean);
+}
+
+/** 给控制台的视图：当前生效时间、来源、对应的 cron 表达式 */
+async function cronConfigForUi(env) {
+  const kv = await kvCronTimes(env);
+  const fromEnv = envCronTimes(env);
+  const times = kv || (fromEnv.length ? fromEnv : CRON_DEFAULT_TIMES);
+  return {
+    times,
+    source: kv ? 'kv' : fromEnv.length ? 'env' : 'default',
+    envRaw: String(env.CRON_SCHEDULES || ''),
+    defaultTimes: CRON_DEFAULT_TIMES,
+    cron: times.map(hhmmToCron),
+    note: '容器版由宿主调度器读取，保存后 20 秒内生效；Cloudflare 版仍需在 wrangler 里配置 cron。',
+  };
+}
+
 /** 以内部请求的方式驱动某个平台的 /api/run，拿到它的汇总 */
 async function runPlatform(mod, env, origin, force) {
   const target = new URL('/api/run' + (force ? '?force=1' : ''), origin);
@@ -3559,7 +3620,7 @@ async function notifyRun(env, result) {
 /* ------------------------------------------------------------------ */
 
 /* 页面版本号：改这个就能确认线上跑的是不是新代码（问「改了怎么没生效」时先看它） */
-const BUILD = '2026-11-02';
+const BUILD = '2026-11-06';
 
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -3852,6 +3913,7 @@ const PAGE = `<!DOCTYPE html>
           <span class="gh-t">GitHub</span>
         </a>
         <button id="runAll" class="pri">全部签到</button>
+        <button id="cronOpen" title="设置每天签到与补签的时间">定时</button>
         <button id="notifyOpen" title="配置签到结果通知">通知</button>
         <button id="logout">退出登录</button>
       </div>
@@ -4622,6 +4684,28 @@ if(saved) login(saved);
       </div>
     </div>
   </div>
+
+  <!-- 定时任务时间表 -->
+  <div class="nv-mask" id="cronModal" hidden>
+    <div class="nv-card" style="width:min(460px,100%)">
+      <div class="nv-head">
+        <h3>签到时间（北京时间）</h3>
+        <button type="button" class="nv-x" id="cronClose">×</button>
+      </div>
+      <div class="nv-body">
+        <section class="nv-sec">
+          <div id="cronRows"></div>
+          <div class="row" style="margin-top:8px"><button type="button" id="cronAdd">+ 添加一个补签时间</button></div>
+          <p class="nv-tip">第一个时间是<b>主签到</b>，其余都是<b>补签轮</b>：已签的账号会跳过，只有出现新签或失败才推送。保存后无需重启，20 秒内生效。</p>
+        </section>
+      </div>
+      <div class="nv-foot">
+        <span class="nv-msg" id="cronMsg"></span>
+        <button type="button" id="cronReset">恢复默认</button>
+        <button type="button" class="pri" id="cronSave">保存</button>
+      </div>
+    </div>
+  </div>
 <script>
 /* 通知弹窗的绑定放这里：它必须等上面的弹窗 DOM 解析完 */
 (function(){
@@ -4705,6 +4789,79 @@ if(saved) login(saved);
       })
       .then(function(){ testBtn.disabled = false; });
   };
+
+  /* ---- 定时任务时间表 ---- */
+  var cronModal = document.getElementById('cronModal');
+  var cronRows = document.getElementById('cronRows');
+  function cronMsg(t){ var el = document.getElementById('cronMsg'); if(el) el.textContent = t; }
+
+  function cronRow(t){
+    var row = document.createElement('div');
+    row.className = 'nv-row';
+    row.innerHTML = '<span>时间</span><input type="time" value="' + t + '">';
+    var del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'nv-copy';
+    del.textContent = '删除';
+    del.onclick = function(){
+      if(cronRows.children.length <= 1) return;
+      row.parentNode.removeChild(row);
+    };
+    row.appendChild(del);
+    return row;
+  }
+  function cronRender(times){
+    cronRows.innerHTML = '';
+    (times && times.length ? times : ['08:10']).forEach(function(t){ cronRows.appendChild(cronRow(t)); });
+  }
+
+  var cronOpenBtn = document.getElementById('cronOpen');
+  if(cronOpenBtn) cronOpenBtn.onclick = function(){
+    cronMsg('');
+    cronModal.hidden = false;
+    api('/api/cron').then(function(c){
+      cronRender(c.times || []);
+      if(c.source === 'env') cronMsg('当前用的是环境变量里的默认值，保存后会改存到 KV。');
+      else if(c.source === 'default') cronMsg('当前是内置默认值，保存后会改存到 KV。');
+    }).catch(function(e){ cronMsg(String(e.message || e)); });
+  };
+
+  var cronCloseBtn = document.getElementById('cronClose');
+  if(cronCloseBtn) cronCloseBtn.onclick = function(){ cronModal.hidden = true; };
+  if(cronModal) cronModal.addEventListener('click', function(ev){ if(ev.target === this) this.hidden = true; });
+
+  var cronAddBtn = document.getElementById('cronAdd');
+  if(cronAddBtn) cronAddBtn.onclick = function(){ cronRows.appendChild(cronRow('10:20')); };
+
+  var cronSaveBtn = document.getElementById('cronSave');
+  if(cronSaveBtn) cronSaveBtn.onclick = function(){
+    var times = [];
+    cronRows.querySelectorAll('input[type=time]').forEach(function(inp){ if(inp.value) times.push(inp.value); });
+    if(!times.length){ cronMsg('至少填一个时间'); return; }
+    cronSaveBtn.disabled = true;
+    cronMsg('保存中…');
+    api('/api/cron', { method:'POST', body: JSON.stringify({ times: times }) })
+      .then(function(d){
+        cronRender(d.times || times);
+        cronMsg('已保存：' + (d.times || times).join(' / ') + '，20 秒内生效');
+      })
+      .catch(function(e){ cronMsg('保存失败：' + String(e.message || e)); })
+      .then(function(){ cronSaveBtn.disabled = false; });
+  };
+
+  var cronResetBtn = document.getElementById('cronReset');
+  if(cronResetBtn) cronResetBtn.onclick = function(){
+    if(!confirm('恢复成环境变量 / 内置默认的时间？')) return;
+    cronResetBtn.disabled = true;
+    cronMsg('恢复中…');
+    api('/api/cron', { method:'POST', body: JSON.stringify({ reset: true }) })
+      .then(function(d){
+        cronRender(d.times || []);
+        cronMsg('已恢复默认：' + (d.times || []).join(' / '));
+      })
+      .catch(function(e){ cronMsg('恢复失败：' + String(e.message || e)); })
+      .then(function(){ cronResetBtn.disabled = false; });
+  };
 })();
 </script>
 
@@ -4753,6 +4910,30 @@ export default {
         return new Response(QQ_OPENID_HELPER, {
           headers: { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' },
         });
+      }
+
+      // 定时任务时间表：读 / 写（容器版宿主调度器直接读 KV，改完即时生效）
+      if (path === '/api/cron' && method === 'GET') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        return json(await cronConfigForUi(env));
+      }
+
+      if (path === '/api/cron' && method === 'POST') {
+        const a = requireAdmin(request, env);
+        if (!a.ok) return a.res;
+        const body = await request.json().catch(() => ({}));
+        // reset=true：删掉 KV 里的配置，回到环境变量/内置默认值
+        if (body.reset === true) {
+          await env.KV.delete(CRON_KEY);
+          return json({ ok: true, ...(await cronConfigForUi(env)) });
+        }
+        const times = [...new Set((Array.isArray(body.times) ? body.times : []).map(normHHMM).filter(Boolean))];
+        if (!times.length) return json({ error: '至少填一个合法时间（HH:MM）' }, 400);
+        if (times.length > 6) return json({ error: '最多 6 个时间点' }, 400);
+        times.sort();
+        await env.KV.put(CRON_KEY, JSON.stringify({ times, updatedAt: new Date().toISOString() }));
+        return json({ ok: true, times, cron: times.map(hhmmToCron) });
       }
 
       // 通知配置：读（脱敏）/ 写
