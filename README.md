@@ -1,8 +1,8 @@
-# Trae + WorkBuddy + Qoder 每日签到 · Cloudflare Worker
+# Trae + WorkBuddy + Qoder 每日签到
 
-把三个平台的每日签到搬到云端：**不用开电脑、不用装客户端、不用守时间**。各登录一次把账号托管进去，之后 Worker 自己续期令牌、按时签到。
+把三个平台的每日签到搬到自己的服务器上：**不用开电脑、不用装客户端、不用守时间**。各登录一次把账号托管进去，之后容器自己续期令牌、按时签到、把结果推到你 QQ / Telegram 上。
 
-全部代码在 `worker.js` 一个文件里，没有构建、没有依赖，粘进 Cloudflare 网页控制台就能跑。
+本项目现在以 **Docker 容器部署**为主：`worker.js`（业务逻辑，全部 Web 标准 API）+ `server.mjs`（Node 宿主：磁盘 KV、HTTP 服务、内置北京时间 cron）。零 npm 依赖，镜像里只有 Node，数据落在一个 JSON 文件里，随 volume 持久化。
 
 |        | Trae    | WorkBuddy | Qoder           |
 | ------ | ------- | --------- | --------------- |
@@ -14,35 +14,46 @@
 
 ---
 
-## 一、部署
+## 一、部署（Docker）
 
-全程在 Cloudflare 网页控制台完成，不用装工具、不用命令行。
+### 1. 准备配置
 
-1. [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Create**，起个名字（如 `signin-all`）
-2. 点 **Edit code**，把 `worker.js` 全文粘进去 → **Deploy**
-3. 回 Worker 设置页，加这几个绑定：
-
-| 类型              | 名称            | 值                                            |
-| --------------- | ------------- | -------------------------------------------- |
-| KV Namespace 绑定 | `KV`          | 先到 **Storage & Databases → KV** 建一个命名空间，回来选中 |
-| Secret          | `MASTER_KEY`  | 32 字节随机值的 base64，用来加密所有令牌                    |
-| Secret          | `ADMIN_TOKEN` | 你自己定的**页面登录密码**                              |
-
-生成主密钥：浏览器 F12 → Console 里跑
-
-```js
-btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
+```bash
+cd workbuddy-trae-checkin
+cp .env.example .env
+vi .env
 ```
 
-> 结果一定是 **44 个字符、以 `=` 结尾**。`MASTER_KEY` 丢了 = KV 里的令牌全解不开，只能重新扫码，**存进密码管理器**。
+`.env` 三个关键变量：
 
-1. **Settings → Triggers → Cron Triggers** 加一条：`10 0 * * *`（北京 08:10）
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `ADMIN_TOKEN` | ✅ | 控制台登录密码（自己定） |
+| `MASTER_KEY` | ✅ | 32 字节随机值的 base64（44 字符、`=` 结尾），加密所有账号令牌。生成：`openssl rand -base64 32`。**丢了 = 令牌全解不开，只能重新扫码，务必存进密码管理器** |
+| `CRON_SECRET` | 建议 | `/cron` 接口的独立口令：`openssl rand -hex 24`。不设会回落用 `ADMIN_TOKEN` |
+
+其余可选变量（通知、Qoder 设备通行证、端口等）见 `.env.example` 内注释。
+
+### 2. 构建并启动
+
+```bash
+docker compose up -d --build
+
+# 验证
+curl http://127.0.0.1:3009/api/health
+```
+
+启动自检会先校验 `ADMIN_TOKEN` / `MASTER_KEY`，配错了容器直接退出并给出原因，不会带病运行。
+
+### 3. 登录
+
+浏览器打开 `http://服务器IP:3009`，输入 `ADMIN_TOKEN` 登录。云服务器记得在安全组放行 3009 端口。
 
 ---
 
 ## 二、添加账号
 
-打开 `https://signin-all.<你的子域>.workers.dev`，输入 `ADMIN_TOKEN` 登录，然后按平台添加。
+打开控制台后按平台添加：
 
 ### Trae：抖音扫码
 
@@ -50,7 +61,7 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 ![从浏览器地址栏复制 127.0.0.1 那整段链接，粘到控制台右侧「扫码登录 · TRAE」下方的输入框](screenshot-console-trae.png)
 
-要注意的是：**粘的是扫码之后那个 `127.0.0.1:17388/...` 的地址**，不是前面授权页的地址——图里输入框的提示文字写的也是这个。
+要注意的是：**粘的是扫码之后那个 `127.0.0.1:17388/...` 的地址**，不是前面授权页的地址。
 
 ### WorkBuddy：微信扫码
 
@@ -60,7 +71,9 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 ### Qoder：国内版设备授权
 
-点「添加账号（国内版）」→ 在新窗口登录并确认授权 → Worker 轮询到结果后自动入库。
+点「添加账号（国内版）」→ 在新窗口登录并确认授权 → 轮询到结果后自动入库。
+
+---
 
 ## 三、控制台
 
@@ -88,94 +101,54 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 ## 四、定时任务
 
-### 方式一：Cloudflare 自带的 Cron（推荐）
+容器**内置调度器**，按**北京时间**执行，不用换算 UTC。默认两条（`.env` 里 `CRON_SCHEDULES` 可改，多条用 `;` 分隔）：
 
-Cloudflare 的 Cron **只认 UTC**：
+| 时间 | 作用 |
+| --- | --- |
+| 每天 08:10 | 三个平台各跑一遍 |
+| 每天 10:20 | 给限流/漏签的补一轮 |
 
-| 设置 | Cron         | 北京时间  | 作用       |
-| -- | ------------ | ----- | -------- |
-| 必设 | `10 0 * * *` | 08:10 | 三个平台各跑一遍 |
-
-配置位置：Cloudflare 控制台 → Workers → 你的 Worker → **Settings → Triggers → Cron Triggers → Add**。
-
-> 换算：**北京 = UTC + 8**。签到接口幂等，多跑几次不会重复加分。
-
-### 方式二：外部定时器
-
-#### 1. 先设口令
-
-Cloudflare 控制台 → Workers → 你的 Worker → **Settings → Variables and Secrets**，加一个：
-
-| 变量名           | 类型     | 值                                        |
-| ------------- | ------ | ---------------------------------------- |
-| `CRON_SECRET` | Secret | 随便一串长随机字符串，比如 `openssl rand -hex 24` 的输出 |
-
-> 不设也行，会回退用 `ADMIN_TOKEN`。但单独设一个更安全——这样定时器口令泄露了不会连带后台也被登进去。
-
-#### 2. 调用
-
-有两种传口令的方式，任选一种：
-
-**方式 A：请求头（推荐）**
+每次定时跑完，**签到结果（含通知是否发送成功）都会记进容器日志**：
 
 ```bash
-curl -X POST https://你的域名/cron \
-  -H "X-Cron-Secret: 你的CRON_SECRET"
+docker compose logs -f --tail 50
+# [2026-11-06 08:10:14 +08:00] 定时签到开始（10 8 * * *）
+# [2026-11-06 08:10:14 +08:00] 签到结果：{ "trae": {...}, "wb": {...}, ... }
+# [2026-11-06 08:10:16 +08:00] 定时签到结束，耗时 2.1s
 ```
 
-**方式 B：URL 参数**
+> 签到接口是幂等的，多跑几次不会重复加分，已签过的显示「今日已签」。
 
-```bash
-curl -X POST "https://你的域名/cron?key=你的CRON_SECRET"
-```
+### 也可以用外部定时器
 
-方式 B 适合那些不方便自定义请求头的调度器（比如某些面板的「URL 定时任务」）。
-
-#### 3. 接到各个调度器上
-
-**Linux / macOS 的 crontab**（每天 08:10 北京时间）
+不想用内置调度器的话，宿主机 crontab 调 `/cron` 接口（记得先配 `CRON_SECRET`）：
 
 ```cron
-10 8 * * * curl -s -X POST https://你的域名/cron -H "X-Cron-Secret: 你的CRON_SECRET" > /dev/null 2>&1
+10 8 * * * curl -s http://127.0.0.1:3009/cron -H "X-Cron-Secret: 你的CRON_SECRET" >/dev/null 2>&1
 ```
 
-**Windows 任务计划**
+也可以 URL 参数传口令：`/cron?key=你的CRON_SECRET`（适合不方便自定义请求头的面板）。口令错了返回 401。`/cron` 走 `force=false`：冷却中或已签的账号直接跳过，想强制重试用控制台的「全部签到」按钮。
 
-```powershell
-schtasks /Create /SC DAILY /ST 08:10 /TN "签到" /TR "curl.exe -s -X POST https://你的域名/cron?key=你的CRON_SECRET"
-```
-
-
-
-#### 4. 返回什么
+返回示例：
 
 ```json
 {
-  "at": "2026-10-24 16:42:00 +08:00",
+  "at": "2026-11-06 08:10:14 +08:00",
   "trae": { "accounts": 1, "checked": 1, "already": 0, "failed": 0, "results": [...] },
   "wb":   { "accounts": 1, "checked": 0, "already": 1, "failed": 0, "results": [...] },
   "qoder":{ "count": 2, "results": [...] }
 }
 ```
 
-各平台的 `results` 里每个账号带 `state` / `msg` / `lastCredit`。如果配了通知渠道，这里还会多一个 `notifyError`（仅当发送失败时出现）。
-
-#### 5. 几个注意点
-
-- **不会重复加分**：签到接口是幂等的，多调几次只是多跑几遍流程，已经领过的会显示「今日已签」。
-- **同一次调用会串行跑三个平台**，整体耗时取决于账号数量，通常几秒。如果调度器有超时限制（比如 5 秒），调大一点。
-- **口令错了返回 401** `{"error":"口令不对"}`；没配任何口令返回 500。
-- **`/cron` 走的是 `force=false`**：账号在冷却期内、或今天已签，会直接跳过，不会硬刷接口。想强制重试用后台的「全部签到」按钮（它是 `force=1`）。
+配了通知渠道时，发送失败会在返回里多一个 `notifyError` 字段。
 
 ---
 
 ## 五、签到结果通知
 
-点顶栏「通知」打开配置，两个渠道各自独立，填完点「发测试」就能立刻验证。
+点顶栏「通知」打开配置，Telegram 与 QQ 机器人两个渠道各自独立，填完点「发测试」立刻验证。每轮跑完（定时任务或「全部签到」）都会推一条汇总；**内置 cron 与手动签到走同一条通知链路，定时签到同样会推送**。
 
 ![通知设置：Telegram 与 QQ 机器人，密钥明文回显，下方是本机取 OpenID 的命令](screenshot-notify.png)
-
-每轮跑完（定时任务或「全部签到」）推一条汇总，两个渠道各管各的，都不配就静默跳过。
 
 ### Telegram
 
@@ -189,52 +162,89 @@ schtasks /Create /SC DAILY /ST 08:10 /TN "签到" /TR "curl.exe -s -X POST https
 **OpenID 用一个本机脚本拿**，不需要域名、不需要备案：
 
 ```bash
-curl -O https://你的域名/qq/openid-helper.mjs && node openid-helper.mjs <AppID> <AppSecret>
+curl -O http://服务器IP:3009/qq/openid-helper.mjs && node openid-helper.mjs <AppID> <AppSecret>
 ```
 
-（弹窗里有 **Windows / macOS·Linux** 切换，两条命令都按你当前系统准备好，点「复制」即可。Windows 用 `curl.exe`（PowerShell 里 `curl` 是 `Invoke-WebRequest` 的别名，不认 `-O`），macOS / Linux 用 `curl`。）
+（控制台弹窗里有 **Windows / macOS·Linux** 切换，命令按你当前系统准备好，点「复制」即可。）
 
 脚本会连上 QQ 的 WebSocket 网关，等你 60 秒——这期间用手机 QQ 给机器人发一条私聊消息，它就会把 `user_openid` 打印出来，然后自己退出。复制那串填进页面，保存。
+
+> QQ 官方对「主动消息」有频次限制，且用户要在 QQ 客户端机器人设置里打开「允许主动发送消息」。
 
 ### 通知长什么样
 
 ```
-📋 签到完成 · 10-24 13:55
+📋 签到完成 · 11-06 08:10
 Trae  ✅ 1/1
-   · 我的号 领取成功 +50 积分
+   · 我的号 签到成功 +50 积分（余额 687.64）
 WorkBuddy  ✅ 0/1 · 已签 1
+   · 主号 今日已签（连签 7 天，累计 700）
 Qoder  ⚠️ 1/2 · 失败 1
    · 备用号 没有可领取的活动
 ```
 
-通道全部失败不影响签到结果，错误只会记在接口返回的 `notifyError` 里。
+新签成功的账号会附带余额 / 连签 / 累计信息；当天已签（skipped）的账号不出明细行。通知失败不影响签到结果，错误记在 `notifyError` 和容器日志里。
 
 ---
 
-## 六、常见问题
+## 六、日常运维
 
-| 现象                                     | 处理                                        |
-| -------------------------------------- | ----------------------------------------- |
-| 提示 `未配置 ADMIN_TOKEN` / `缺少 MASTER_KEY` | Secret 名字要**完全一致**，区分大小写                  |
-| 提示 `MASTER_KEY 必须是 32 字节`              | 重新生成，确认 44 字符且以 `=` 结尾                    |
-| 提示 `未绑定 KV`                            | KV 绑定名必须**完全等于** `KV`                     |
-| 列表是空的                                  | 还没加账号，或 cron 还没到点                         |
-| Trae 扫码后停在「无法访问此网站」                    | 正常，官网只回送 127.0.0.1，复制地址栏整段链接回来粘           |
-| 粘贴后报「没找到 authCodeInfo」                 | 复制时漏了 `?` 后面的部分，重新全选地址栏                   |
-| Trae 显示「限流 N 分钟」                       | 服务端限流，等冷却结束自动重试；再加一轮 cron 更容易补上           |
-| Qoder 显示「无可领」                          | 看下面那行诊断：`返回 0 条` 多为当天没活动，`CLAIMED` 说明今天已领 |
-| 删掉账号重新添加却直接是「已绑定」                      | 旧版本的问题，本版已修；已出现的点「解除绑定」重来                 |
-| 一直没动静                                  | 检查 cron 是否配了，注意填的是 UTC                    |
-| 令牌失效                                   | 改过密码或在别处登出，删掉账号重新添加                       |
+```bash
+docker compose logs -f --tail 50    # 看日志（含每天定时签到的结果）
+docker compose restart              # 重启
+docker compose up -d --build        # 改了代码后重建
+tar -cf backup.tar data/            # 备份：账号令牌全在 data/kv.json（加密存储）
+```
 
-排障时可以看 Worker 详情页的 **Logs**；Qoder 的细节用 `GET /qoder/api/inspect?id=<账号id>` 看，它会返回接口实际给了几条、分别是什么类型。
+改登录密码 / 任何 `.env` 变量：
+
+```bash
+vi .env && docker compose up -d     # compose 检测到变量变化，自动重建容器
+```
+
+> 注意 `docker restart` **不会**重新读取环境变量——环境变量在容器创建时就固定了，必须重建。改密码不影响已添加的账号（令牌在 KV 里，跟登录密码是分开的）。
 
 ---
 
-## 七、说明
+## 七、常见问题
 
-**安全**：KV 里存的是 AES-256-GCM 密文（每条记录独立 salt + IV，密钥由 `MASTER_KEY` 经 HKDF 派生）；接口不返回任何令牌；登录密码和账号令牌分离，泄露密码不等于丢号。边界是：令牌在 Worker 内存里必然有一刻是明文，云端能看到什么取决于你是否信任它——介意就部署到自己账号下。
+| 现象 | 处理 |
+| --- | --- |
+| 容器起来又退出 | `docker compose logs` 看自检输出：多半是 `MASTER_KEY` 格式不对（要 44 字符、`=` 结尾）或没填 `ADMIN_TOKEN` |
+| 接口报 `EACCES ... kv.json.tmp`、添加不了账号 | 宿主机 `data/` 目录属主不对（容器以 uid 100 运行）：`chown -R 100:101 data/` 后重建容器 |
+| 页面打不开 | 检查 `ports` 映射和防火墙；云服务器还要在安全组放行 3009 |
+| Trae 扫码后停在「无法访问此网站」 | 正常，官网只回送 127.0.0.1，复制地址栏整段链接回来粘 |
+| 粘贴后报「没找到 authCodeInfo」 | 复制时漏了 `?` 后面的部分，重新全选地址栏 |
+| Trae 显示「限流 N 分钟」 | 服务端限流，等冷却结束自动重试；10:20 的补签轮也会兜底 |
+| Qoder 显示「无可领」 | 看下面那行诊断：`返回 0 条` 多为当天没活动，`CLAIMED` 说明今天已领 |
+| 列表是空的 | 还没加账号，或 cron 还没到点 |
+| 定时跑了但没收到推送 | 先看日志里的「签到结果」行有没有 `notifyError`；再点通知设置的「发测试」验证渠道。QQ 注意主动消息频次限制和「允许主动发送消息」开关 |
+| 令牌失效 | 改过密码或在别处登出，删掉账号重新添加 |
+| Orange Pi / 服务器重启后服务没起 | `docker-compose.yml` 已带 `restart: unless-stopped`，确认容器不是被手动 stop 的 |
+| 老系统没有 `docker compose` | 用 `docker-compose`（带横线），或装 `docker-compose-plugin` |
+
+Qoder 的细节用 `GET /qoder/api/inspect?id=<账号id>` 看，它会返回接口实际给了几条、分别是什么类型。
+
+---
+
+## 八、说明
+
+**安全**：`data/kv.json` 里存的是 AES-256-GCM 密文（每条记录独立 salt + IV，密钥由 `MASTER_KEY` 经 HKDF 派生）；接口不返回任何令牌；登录密码和账号令牌分离，泄露密码不等于丢号。数据完全在自己服务器上。边界是：令牌在容器内存里必然有一刻是明文。
 
 **限制**：三个平台的接口都是逆向得到的，客户端升级可能需要跟进适配；只做签到，没做成长期任务/兑换那套；扫码依赖官方登录页。
 
-**风险**：本项目为非官方工具， Trae、WorkBuddy、Qoder 使用风险自负。建议只给自己的账号用，多账号大规模刷积分更容易触发风控。
+**风险**：本项目为非官方工具，Trae、WorkBuddy、Qoder 使用风险自负。建议只给自己的账号用，多账号大规模刷积分更容易触发风控。
+
+---
+
+## 附：Cloudflare Worker 版
+
+`worker.js` 依然可以在 Cloudflare Workers 上单独运行（KV 绑定名 `KV` + Secrets `MASTER_KEY` / `ADMIN_TOKEN` + Cron Trigger `10 0 * * *` UTC，即北京 08:10），详细步骤见仓库历史版本 README。容器版与 Cloudflare 版的差异：
+
+| | Cloudflare Worker 版 | Docker 版（当前） |
+| --- | --- | --- |
+| 运行位置 | Cloudflare 边缘节点 | 自己的服务器 / Orange Pi |
+| KV | Cloudflare KV | `data/kv.json`（同样只存密文） |
+| Cron | UTC 表达式，Cloudflare 控制台配 | 北京时间表达式，容器内置 |
+| 通知 | 手动签到才触发 | 签到 + 通知一体，定时/手动都会推 |
+| 健康检查 | 无 | `GET /api/health`，免登录 |
