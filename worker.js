@@ -3104,7 +3104,21 @@ async function runPlatform(mod, env, origin, force) {
   return data;
 }
 
-async function runAll(env, origin, force) {
+/** 定时轮是否值得推送：有新签、有失败、或整个平台异常才算「有消息」 */
+function hasSignNews(out) {
+  for (const key of ['trae', 'wb', 'qoder']) {
+    const d = out[key];
+    if (!d) continue;
+    if (d.error) return true; // 平台整体异常，要让用户知道
+    for (const r of d.results || []) {
+      if (r.state === 'checked') return true; // 有新签
+      if (r.state !== 'skipped' && r.state !== 'already') return true; // 失败/冷却等其他状态
+    }
+  }
+  return false;
+}
+
+async function runAll(env, origin, force, trigger = 'manual') {
   const out = {};
   for (const [key, mod, e] of [
     ['trae', Trae, traeEnv(env)],
@@ -3121,6 +3135,12 @@ async function runAll(env, origin, force) {
     at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
     ...out,
   };
+  // 定时轮（含 10:20 补签轮）没有新签、没有失败就不推送，避免重复的「已签」刷屏；
+  // 手动触发（控制台「立即签到」）始终推送。
+  if (trigger === 'cron' && !hasSignNews(out)) {
+    result.notifySkipped = '全部已签，无新签/失败，跳过推送';
+    return result;
+  }
   // 通知放在最后：失败只记一笔，不能影响签到结果
   try {
     const n = await notifyRun(env, result);
@@ -4707,7 +4727,7 @@ export default {
       if (path === '/cron') {
         const c = requireCron(request, env);
         if (!c.ok) return c.res;
-        return json(await runAll(env, url.origin, false));
+        return json(await runAll(env, url.origin, false, 'cron'));
       }
 
       // Trae 的授权链接里回调地址写死为 <origin>/oauth/callback，必须留在根路径
@@ -4725,7 +4745,7 @@ export default {
         const a = requireAdmin(request, env);
         if (!a.ok) return a.res;
         const force = url.searchParams.get('force') === '1';
-        return json(await runAll(env, url.origin, force));
+        return json(await runAll(env, url.origin, force, 'manual'));
       }
 
       // 本机脚本：用 WebSocket 抓 user_openid（不需要域名/备案）
